@@ -23,7 +23,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, AIMessage
 
 from config import (
-    DEEPSEEK_API_KEY, AGENT_MODEL, AGENT_TEMPERATURE,
+    LLM_API_KEY, AGENT_MODEL, AGENT_TEMPERATURE,
     AGENT_MAX_ITERATIONS, AGENT_MAX_TOKENS, LOW_BUDGET_THRESHOLD,
 )
 from services.tools import ALL_TOOLS
@@ -62,7 +62,7 @@ PLAN_SYSTEM_PROMPT = """你是一位专业的旅行规划师，拥有多种工�
 - 最后给出3个本地隐藏彩蛋玩法
 - 语言亲切自然，像朋友推荐一样
 - 如果天气有特殊情况，方案开头给出天气出行提示
-- 方案必须一次性给出完整信息，不要以问句结尾（如"需要我帮您…？""要不要…？"），用户没有继续对话的入口
+- 方案必须一次性给出完整信息，不要以问句结尾（如"需要我帮您…？""要不要…？"）
 
 注意：务必实际调用工具获取实时数据，不要凭空编造天气、路线或酒店信息。
 
@@ -78,7 +78,30 @@ CHAT_SYSTEM_PROMPT = """你是{destination}的智能旅行顾问，名字叫"小
 2. 回答要具体、实用，尽量引用工具返回的实时数据
 3. 可以根据你的知识合理补充
 4. 不要回答与旅行无关的问题
-5. 不要以问句结尾（如"需要我帮您…？""要不要…？"），用户没有继续对话的入口，所有信息请一次性给全
+5. 不要以问句结尾（如"需要我帮您…？""要不要…？"），所有信息请一次性给全
+
+{memory_context}"""
+
+PLAN_CHAT_SYSTEM_PROMPT = """你是用户的行程追问助手。用户已经有一份生成的旅行方案，现在对方案有疑问或想调整。
+
+## 当前行程方案
+{plan_text}
+
+## 你的任务
+基于上面的行程方案，回答用户的问题或根据用户需求调整方案。你可以调用工具查询实时信息来辅助回答。
+
+## 常见场景
+- 用户想替换某天的景点 → 调用工具搜索替代景点，给出调整后的日程
+- 用户问某天的交通细节 → 调用路线规划工具查询
+- 用户想调整预算 → 根据实际情况增删项目
+- 用户对某处有疑问 → 解释原因，必要时查工具补充信息
+
+## 回答要求
+1. 直接针对用户的问题回答，不要复述整个方案
+2. 如果涉及修改，只输出修改的部分，说明修改原因
+3. 需要查实时数据时主动调用工具，不要编造
+4. 语气自然亲切，像朋友讨论行程一样
+5. 不要以问句结尾（如"需要我帮您…？""要不要…？"），所有信息请一次性给全
 
 {memory_context}"""
 
@@ -95,8 +118,8 @@ class TravelAgent:
     """
 
     def __init__(self):
-        if not DEEPSEEK_API_KEY:
-            raise ValueError("请在 .env 文件中配置 DEEPSEEK_API_KEY")
+        if not LLM_API_KEY:
+            raise ValueError("请在 .env 文件中配置 LLM_API_KEY（或 DEEPSEEK_API_KEY）")
 
         self.tools = ALL_TOOLS
         self.memory = get_memory_manager()
@@ -116,6 +139,18 @@ class TravelAgent:
         """构建带记忆上下文的聊天 Agent。"""
         system_prompt = CHAT_SYSTEM_PROMPT.format(
             destination=destination,
+            memory_context=memory_context or "（暂无该用户的历史记忆）"
+        )
+        return create_agent(
+            model=llm,
+            tools=self.tools,
+            system_prompt=system_prompt,
+        )
+
+    def _get_plan_chat_agent(self, plan_text: str, memory_context: str = ""):
+        """构建行程追问 Agent，把已生成的方案注入 system prompt 作为上下文。"""
+        system_prompt = PLAN_CHAT_SYSTEM_PROMPT.format(
+            plan_text=plan_text,
             memory_context=memory_context or "（暂无该用户的历史记忆）"
         )
         return create_agent(
@@ -356,6 +391,90 @@ class TravelAgent:
                 pass
 
         return reply
+
+    def chat_about_plan(self, user_id: int | None, destination: str,
+                        plan_text: str, message: str,
+                        client_history: list[dict] | None = None) -> str:
+        """行程追问：基于已生成的方案回答用户的问题。
+
+        与 chat() 的区别：
+        - chat() 是通用的目的地聊天，system prompt 是"小旅"人设
+        - chat_about_plan() 把行程方案全文注入 system prompt，Agent 能看到完整方案
+        - 前端把追问历史传来，保持对话连贯
+        """
+        memory_context = self.memory.build_context(user_id) if user_id else ""
+
+        # 构建对话历史
+        chat_messages = []
+        if client_history:
+            for msg in client_history:
+                if msg.get("role") == "user":
+                    chat_messages.append(HumanMessage(content=msg.get("text", "")))
+                else:
+                    chat_messages.append(AIMessage(content=msg.get("text", "")))
+
+        chat_messages.append(HumanMessage(content=message))
+
+        # 用行程方案构建专门的追问 Agent
+        plan_chat_agent = self._get_plan_chat_agent(plan_text, memory_context)
+
+        result = plan_chat_agent.invoke({"messages": chat_messages})
+        result_messages = result.get("messages", [])
+
+        # 取最后一条 AIMessage（跳过工具调用消息）
+        reply = ""
+        for m in reversed(result_messages):
+            if isinstance(m, AIMessage) and m.content and not getattr(m, "tool_calls", []):
+                reply = m.content
+                break
+
+        return reply
+
+    def chat_about_plan_stream(self, user_id: int | None, destination: str,
+                               plan_text: str, message: str,
+                               client_history: list[dict] | None = None,
+                               queue: asyncio.Queue = None) -> str:
+        """行程追问的流式版本，通过 queue 实时推送 Agent 回答。"""
+        memory_context = self.memory.build_context(user_id) if user_id else ""
+
+        chat_messages = []
+        if client_history:
+            for msg in client_history:
+                if msg.get("role") == "user":
+                    chat_messages.append(HumanMessage(content=msg.get("text", "")))
+                else:
+                    chat_messages.append(AIMessage(content=msg.get("text", "")))
+
+        chat_messages.append(HumanMessage(content=message))
+
+        plan_chat_agent = self._get_plan_chat_agent(plan_text, memory_context)
+
+        final_answer = ""
+        for event in plan_chat_agent.stream(
+            {"messages": chat_messages},
+            stream_mode="updates",
+        ):
+            for node_name, node_output in event.items():
+                if not isinstance(node_output, dict) or "messages" not in node_output:
+                    continue
+                for msg in node_output["messages"]:
+                    if isinstance(msg, AIMessage):
+                        tool_calls = getattr(msg, "tool_calls", [])
+                        if tool_calls and queue:
+                            for tc in tool_calls:
+                                queue.put_nowait({
+                                    "type": "tool_call",
+                                    "tool": tc.get("name", ""),
+                                    "args": tc.get("args", {}),
+                                })
+                        elif msg.content:
+                            final_answer = msg.content
+
+        if queue:
+            queue.put_nowait({"type": "final_answer", "content": final_answer})
+            queue.put_nowait({"type": "done"})
+
+        return final_answer
 
 
 # ── 全局单例 ──

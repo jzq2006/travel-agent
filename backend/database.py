@@ -3,6 +3,9 @@ from contextlib import contextmanager
 
 import config
 from auth import hash_password
+import logging
+
+logger = logging.getLogger("travel-agent")
 
 
 @contextmanager
@@ -202,17 +205,25 @@ def load_conversation(user_id: int, session_id: str, limit: int = 20) -> list[di
     return list(reversed([dict(r) for r in rows]))
 
 
-def get_or_create_session(user_id: int) -> str:
-    """获取用户最近的会话ID，如果超过30分钟无活动则创建新会话。"""
+def get_or_create_session(user_id: int, timeout_minutes: int = 30) -> str:
+    """获取用户最近的会话ID，如果超过指定分钟无活动则创建新会话。"""
     with get_db() as conn:
         row = conn.execute(
-            """SELECT session_id FROM conversation_history
+            """SELECT session_id, created_at FROM conversation_history
                WHERE user_id = ?
                ORDER BY id DESC LIMIT 1""",
             (user_id,),
         ).fetchone()
         if row:
-            return row["session_id"]
+            # 检查最后活跃时间是否在超时窗口内
+            inactive_rows = conn.execute(
+                "SELECT 1 FROM conversation_history "
+                "WHERE user_id = ? AND session_id = ? "
+                "AND created_at > datetime('now', 'localtime', ?)",
+                (user_id, row["session_id"], f"-{timeout_minutes} minutes"),
+            ).fetchall()
+            if inactive_rows:
+                return row["session_id"]
     import uuid
     return uuid.uuid4().hex[:12]
 
@@ -277,3 +288,68 @@ def load_recent_plans(user_id: int, limit: int = 3) -> list[dict]:
             (user_id, limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── 记忆清理 ──
+
+def cleanup_memory() -> dict:
+    """清理过期的记忆数据，返回各表的清理数量。"""
+    stats = {"conversation": 0, "facts": 0, "plans": 0, "logs": 0}
+
+    with get_db() as conn:
+        # 短期记忆：删除超过 N 天的对话
+        stats["conversation"] = conn.execute(
+            "DELETE FROM conversation_history "
+            "WHERE created_at < datetime('now', 'localtime', ?)",
+            (f"-{config.MEMORY_MAX_CONVERSATION_DAYS} days",),
+        ).rowcount
+
+        # 短期记忆：每个用户最多保留 N 条
+        users = conn.execute("SELECT DISTINCT user_id FROM conversation_history").fetchall()
+        for user in users:
+            uid = user["user_id"]
+            conn.execute(
+                "DELETE FROM conversation_history WHERE id IN ("
+                "  SELECT id FROM conversation_history "
+                "  WHERE user_id = ? ORDER BY id DESC LIMIT -1 OFFSET ?"
+                ")",
+                (uid, config.MEMORY_MAX_CONVERSATION_PER_USER),
+            )
+
+        # 长期记忆：每个用户最多保留 N 条事实，超出按时间淘汰
+        users = conn.execute("SELECT DISTINCT user_id FROM user_memory").fetchall()
+        for user in users:
+            uid = user["user_id"]
+            deleted = conn.execute(
+                "DELETE FROM user_memory WHERE id IN ("
+                "  SELECT id FROM user_memory "
+                "  WHERE user_id = ? ORDER BY created_at DESC LIMIT -1 OFFSET ?"
+                ")",
+                (uid, config.MEMORY_MAX_FACTS_PER_USER),
+            ).rowcount
+            stats["facts"] += deleted
+
+        # 工作记忆：每个用户最多保留 N 条方案
+        users = conn.execute("SELECT DISTINCT user_id FROM plan_history").fetchall()
+        for user in users:
+            uid = user["user_id"]
+            conn.execute(
+                "DELETE FROM plan_history WHERE id IN ("
+                "  SELECT id FROM plan_history "
+                "  WHERE user_id = ? ORDER BY created_at DESC LIMIT -1 OFFSET ?"
+                ")",
+                (uid, config.MEMORY_MAX_PLANS_PER_USER),
+            )
+
+        # Agent 日志：删除超过 N 天的
+        stats["logs"] = conn.execute(
+            "DELETE FROM agent_logs "
+            "WHERE created_at < datetime('now', 'localtime', ?)",
+            (f"-{config.MEMORY_MAX_LOG_DAYS} days",),
+        ).rowcount
+
+    logger.info(
+        f"记忆清理完成: 对话={stats['conversation']}, "
+        f"事实={stats['facts']}, 方案={stats['plans']}, 日志={stats['logs']}"
+    )
+    return stats

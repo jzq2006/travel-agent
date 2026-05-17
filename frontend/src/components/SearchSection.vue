@@ -134,6 +134,47 @@
           <button @click="planResult = ''" class="close-plan">&times;</button>
         </div>
         <div class="plan-content">{{ planResult }}</div>
+
+        <!-- 追问入口按钮 -->
+        <button class="plan-chat-trigger" @click="showPlanChat = true">
+          💬 对方案有疑问？点击追问
+        </button>
+
+        <!-- 追问聊天窗口 -->
+        <transition name="chat-slide">
+          <div v-if="showPlanChat" class="plan-chat-panel">
+            <div class="plan-chat-header">
+              <span>💬 行程追问</span>
+              <button class="plan-chat-close" @click="showPlanChat = false">&times;</button>
+            </div>
+            <div class="plan-chat-messages" ref="chatMessagesRef">
+              <div v-if="planChatMessages.length === 0" class="plan-chat-empty">
+                对生成的方案有任何疑问或想调整的地方，随时告诉我
+              </div>
+              <div
+                v-for="(msg, i) in planChatMessages"
+                :key="i"
+                :class="['plan-chat-bubble', msg.role === 'user' ? 'bubble-user' : 'bubble-ai']"
+              >
+                {{ msg.text }}
+              </div>
+              <div v-if="planChatLoading" class="plan-chat-bubble bubble-ai">
+                <span class="typing-dots"><span></span><span></span><span></span></span>
+              </div>
+            </div>
+            <div class="plan-chat-input-bar">
+              <input
+                v-model="planChatInput"
+                @keyup.enter="sendPlanChat"
+                placeholder="例如：第三天能换成爬长城吗？"
+                :disabled="planChatLoading"
+              />
+              <button @click="sendPlanChat" :disabled="planChatLoading || !planChatInput.trim()">
+                发送
+              </button>
+            </div>
+          </div>
+        </transition>
       </div>
     </transition>
   </section>
@@ -161,6 +202,11 @@ export default {
       isLoading: false,
       planResult: '',
       agentSteps: [],
+      // 追问聊天状态
+      showPlanChat: false,      // 追问窗口是否显示
+      planChatInput: '',         // 追问输入框内容
+      planChatMessages: [],      // 追问对话历史 [{role:'user'|'assistant', text:'...'}]
+      planChatLoading: false,    // 追问是否正在等待回复
       toolNameMap: {
         query_weather: '查询天气',
         search_attractions: '搜索景点',
@@ -237,6 +283,12 @@ export default {
           body: JSON.stringify(requestBody),
         })
 
+        if (!response.ok) {
+          const errData = await response.json().catch(() => null)
+          const msg = errData?.detail || `请求失败 (${response.status})`
+          throw new Error(msg)
+        }
+
         const reader = response.body.getReader()
         const decoder = new TextDecoder()
         let buffer = ''
@@ -264,21 +316,98 @@ export default {
           }
         }
 
+        if (!this.planResult) {
+          throw new Error('未收到方案结果')
+        }
+
         this.$nextTick(() => {
           const el = document.querySelector('.plan-result')
           if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
         })
       } catch (err) {
-        // Fallback: use non-streaming endpoint
-        try {
-          const { data } = await api.post('/generate-plan', requestBody)
-          this.planResult = data.plan
-        } catch (err2) {
-          const msg = err2.response?.data?.detail || '生成方案失败，请稍后重试'
-          alert(msg)
+        // Show error or fallback to non-streaming endpoint
+        const errMsg = err.message || ''
+        if (errMsg && errMsg !== '未收到方案结果') {
+          alert(errMsg)
+        } else {
+          try {
+            const { data } = await api.post('/generate-plan', requestBody)
+            this.planResult = data.plan
+          } catch (err2) {
+            const msg = err2.response?.data?.detail || '生成方案失败，请稍后重试'
+            alert(msg)
+          }
         }
       } finally {
         this.isLoading = false
+        // 方案生成完，重置追问状态，打开追问入口
+        this.showPlanChat = false
+        this.planChatMessages = []
+        this.planChatInput = ''
+      }
+    },
+    async sendPlanChat() {
+      const msg = this.planChatInput.trim()
+      if (!msg || this.planChatLoading) return
+
+      this.planChatMessages.push({ role: 'user', text: msg })
+      this.planChatInput = ''
+      this.planChatLoading = true
+
+      try {
+        const token = localStorage.getItem('token')
+        const response = await fetch('/api/chat/plan', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            destination: this.destination,
+            plan_text: this.planResult,
+            message: msg,
+            history: this.planChatMessages.slice(0, -1),
+          }),
+        })
+
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        let reply = ''
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue
+            const raw = line.slice(6).trim()
+            if (!raw) continue
+            try {
+              const event = JSON.parse(raw)
+              if (event.type === 'final_answer') {
+                reply = event.content
+              }
+            } catch { /* ignore parse errors */ }
+          }
+        }
+
+        this.planChatMessages.push({ role: 'assistant', text: reply || '（未获取到回复）' })
+      } catch (err) {
+        this.planChatMessages.push({
+          role: 'assistant',
+          text: '抱歉，追问服务暂时不可用，请稍后重试。',
+        })
+      } finally {
+        this.planChatLoading = false
+        this.$nextTick(() => {
+          const el = this.$refs.chatMessagesRef
+          if (el) el.scrollTop = el.scrollHeight
+        })
       }
     },
     formatArgs(args) {
@@ -737,5 +866,187 @@ export default {
   .search-form {
     grid-template-columns: 1fr;
   }
+  .plan-chat-panel {
+    max-height: 400px;
+  }
+}
+
+/* ── 追问入口按钮 ── */
+.plan-chat-trigger {
+  display: block;
+  width: 100%;
+  padding: 14px;
+  border: none;
+  background: linear-gradient(135deg, #f0f0ff, #eef2ff);
+  color: #6366f1;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s;
+  border-top: 1px solid rgba(99, 102, 241, 0.1);
+}
+
+.plan-chat-trigger:hover {
+  background: linear-gradient(135deg, #eef2ff, #e0e7ff);
+}
+
+/* ── 追问聊天窗口 ── */
+.plan-chat-panel {
+  background: #f8fafc;
+  border-top: 2px solid rgba(99, 102, 241, 0.15);
+  display: flex;
+  flex-direction: column;
+  max-height: 500px;
+}
+
+.plan-chat-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 20px;
+  background: white;
+  border-bottom: 1px solid #e2e8f0;
+  font-weight: 600;
+  color: #334155;
+  font-size: 0.95rem;
+}
+
+.plan-chat-close {
+  background: none;
+  border: none;
+  font-size: 1.4rem;
+  cursor: pointer;
+  color: #94a3b8;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  transition: all 0.2s;
+}
+
+.plan-chat-close:hover {
+  background: #f1f5f9;
+  color: #64748b;
+}
+
+.plan-chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 120px;
+  max-height: 320px;
+}
+
+.plan-chat-empty {
+  text-align: center;
+  color: #94a3b8;
+  font-size: 0.9rem;
+  padding: 20px 0;
+}
+
+.plan-chat-bubble {
+  max-width: 80%;
+  padding: 10px 14px;
+  border-radius: 14px;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bubble-user {
+  align-self: flex-end;
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  color: white;
+  border-bottom-right-radius: 4px;
+}
+
+.bubble-ai {
+  align-self: flex-start;
+  background: white;
+  color: #334155;
+  border: 1px solid #e2e8f0;
+  border-bottom-left-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+}
+
+.plan-chat-input-bar {
+  display: flex;
+  gap: 10px;
+  padding: 12px 20px;
+  background: white;
+  border-top: 1px solid #e2e8f0;
+}
+
+.plan-chat-input-bar input {
+  flex: 1;
+  padding: 10px 14px;
+  border: 2px solid #e2e8f0;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  transition: border-color 0.2s;
+}
+
+.plan-chat-input-bar input:focus {
+  outline: none;
+  border-color: #6366f1;
+}
+
+.plan-chat-input-bar button {
+  padding: 10px 20px;
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  color: white;
+  border: none;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.plan-chat-input-bar button:hover:not(:disabled) {
+  opacity: 0.9;
+  transform: translateY(-1px);
+}
+
+.plan-chat-input-bar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 打字动画 */
+.typing-dots {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.typing-dots span {
+  width: 6px;
+  height: 6px;
+  background: #94a3b8;
+  border-radius: 50%;
+  animation: dotPulse 1.2s ease infinite;
+}
+
+.typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+/* 窗口滑入动画 */
+.chat-slide-enter-active,
+.chat-slide-leave-active {
+  transition: all 0.3s ease;
+}
+
+.chat-slide-enter-from,
+.chat-slide-leave-to {
+  opacity: 0;
+  max-height: 0;
+  overflow: hidden;
 }
 </style>

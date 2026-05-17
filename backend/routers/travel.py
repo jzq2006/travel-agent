@@ -18,17 +18,18 @@ import json
 import re
 import uuid
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
 
 from auth import require_login, get_current_user
 from database import get_db, get_user_preferences, save_user_preferences
 from models import (
     TravelPlanRequest, ChatRequest, BookingRequest, SubscribeRequest,
-    UserPreferencesRequest,
+    UserPreferencesRequest, PlanChatRequest,
 )
 from services.agent import get_travel_agent
 from services.memory import get_memory_manager
+from services.rate_limiter import plan_limiter, chat_limiter
 from config import STYLE_MAP, LOW_BUDGET_THRESHOLD
 
 router = APIRouter()
@@ -37,7 +38,12 @@ router = APIRouter()
 # ── Agent 出行方案生成（非流式） ──
 
 @router.post("/api/generate-plan")
-async def generate_travel_plan(request: TravelPlanRequest, user=Depends(require_login)):
+async def generate_travel_plan(
+    req: TravelPlanRequest,
+    http_request: Request,
+    user=Depends(require_login),
+):
+    plan_limiter.check_request(http_request, user)
     """Agent 自主编排工具调用，生成完整出行方案。
 
     记忆系统集成：
@@ -46,23 +52,23 @@ async def generate_travel_plan(request: TravelPlanRequest, user=Depends(require_
     """
     try:
         agent = get_travel_agent()
-        style_text = STYLE_MAP.get(request.travelType, request.travelType)
+        style_text = STYLE_MAP.get(req.travelType, req.travelType)
         date_range = (
-            f"{request.startDate}至{request.endDate}"
-            if request.startDate and request.endDate else "未指定"
+            f"{req.startDate}至{req.endDate}"
+            if req.startDate and req.endDate else "未指定"
         )
 
         request_data = {
-            "destination": request.destination,
-            "duration": request.duration,
-            "peopleCount": request.peopleCount,
-            "budget": request.budget,
+            "destination": req.destination,
+            "duration": req.duration,
+            "peopleCount": req.peopleCount,
+            "budget": req.budget,
             "style_text": style_text,
-            "selectedPreferences": request.selectedPreferences or [],
-            "dietaryRequirements": request.dietaryRequirements,
-            "desiredAttractions": request.desiredAttractions,
+            "selectedPreferences": req.selectedPreferences or [],
+            "dietaryRequirements": req.dietaryRequirements,
+            "desiredAttractions": req.desiredAttractions,
             "date_range": date_range,
-            "remarks": request.remarks,
+            "remarks": req.remarks,
             "user_id": user["user_id"] if user else None,
         }
 
@@ -75,26 +81,32 @@ async def generate_travel_plan(request: TravelPlanRequest, user=Depends(require_
 # ── Agent 出行方案生成（SSE 流式） ──
 
 @router.post("/api/generate-plan/stream")
-async def generate_plan_stream(request: TravelPlanRequest, user=Depends(require_login)):
+async def generate_plan_stream(
+    req: TravelPlanRequest,
+    http_request: Request,
+    user=Depends(require_login),
+):
     """SSE 流式端点：实时推送 Agent 的思考过程和工具调用。"""
+    plan_limiter.check_request(http_request, user)
+
     agent = get_travel_agent()
-    style_text = STYLE_MAP.get(request.travelType, request.travelType)
+    style_text = STYLE_MAP.get(req.travelType, req.travelType)
     date_range = (
-        f"{request.startDate}至{request.endDate}"
-        if request.startDate and request.endDate else "未指定"
+        f"{req.startDate}至{req.endDate}"
+        if req.startDate and req.endDate else "未指定"
     )
 
     request_data = {
-        "destination": request.destination,
-        "duration": request.duration,
-        "peopleCount": request.peopleCount,
-        "budget": request.budget,
+        "destination": req.destination,
+        "duration": req.duration,
+        "peopleCount": req.peopleCount,
+        "budget": req.budget,
         "style_text": style_text,
-        "selectedPreferences": request.selectedPreferences or [],
-        "dietaryRequirements": request.dietaryRequirements,
-        "desiredAttractions": request.desiredAttractions,
+        "selectedPreferences": req.selectedPreferences or [],
+        "dietaryRequirements": req.dietaryRequirements,
+        "desiredAttractions": req.desiredAttractions,
         "date_range": date_range,
-        "remarks": request.remarks,
+        "remarks": req.remarks,
         "user_id": user["user_id"] if user else None,
     }
 
@@ -126,15 +138,13 @@ async def generate_plan_stream(request: TravelPlanRequest, user=Depends(require_
 # ── Agent 智能聊天 ──
 
 @router.post("/api/chat")
-async def chat(request: ChatRequest, user=Depends(require_login)):
-    """Agent 聊天模式，集成三层记忆。
-
-    记忆流程：
-    - 短期：从 DB 加载当前会话的历史对话 → 服务端管理，不依赖前端
-    - 长期 + 工作：build_context() 注入 system prompt
-    - 保存当前轮次到短期记忆
-    - 自动从对话中提取事实到长期记忆
-    """
+async def chat(
+    request: ChatRequest,
+    http_request: Request,
+    user=Depends(require_login),
+):
+    """Agent 聊天模式，集成三层记忆。"""
+    chat_limiter.check_request(http_request, user)
     try:
         agent = get_travel_agent()
         user_id = user["user_id"] if user else None
@@ -149,6 +159,46 @@ async def chat(request: ChatRequest, user=Depends(require_login)):
         return {"reply": reply}
     except Exception as e:
         raise HTTPException(status_code, detail=f"聊天服务失败: {str(e)}")
+
+
+# ── 行程追问（SSE 流式） ──
+
+@router.post("/api/chat/plan")
+async def chat_about_plan(
+    req: PlanChatRequest,
+    http_request: Request,
+    user=Depends(require_login),
+):
+    """SSE 流式追问：基于已生成的行程方案回答用户追问。"""
+    chat_limiter.check_request(http_request, user)
+
+    agent = get_travel_agent()
+    user_id = user["user_id"] if user else None
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def event_stream():
+        loop = asyncio.get_event_loop()
+        agent_task = loop.run_in_executor(
+            None,
+            agent.chat_about_plan_stream,
+            user_id, req.destination, req.plan_text,
+            req.message, req.history, queue,
+        )
+
+        done = False
+        while not done:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=120)
+            except asyncio.TimeoutError:
+                break
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if event.get("type") == "done":
+                done = True
+
+        await agent_task
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # ── 预订管理 ──

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 
 from auth import require_admin
-from database import get_db
+from database import get_db, cleanup_memory
 
 router = APIRouter()
 
@@ -37,3 +37,10 @@ async def admin_agent_logs(admin=Depends(require_admin)):
             "SELECT * FROM agent_logs ORDER BY created_at DESC LIMIT 100"
         ).fetchall()
     return {"logs": [dict(r) for r in rows]}
+
+
+@router.post("/api/admin/cleanup")
+async def admin_cleanup(admin=Depends(require_admin)):
+    """手动触发记忆清理。"""
+    stats = cleanup_memory()
+    return {"success": True, "cleaned": stats}

@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from database import init_db, seed_admin
+from database import init_db, seed_admin, cleanup_memory
 from routers import auth, admin, travel
 from config import CORS_ORIGINS
 
@@ -25,6 +25,7 @@ async def lifespan(app: FastAPI):
     init_db()
     seed_admin()
     logger.info("数据库初始化完成")
+    cleanup_memory()
     yield
     logger.info("应用关闭")
 

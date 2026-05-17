@@ -46,10 +46,10 @@
 
 import json
 
-from langchain_deepseek import ChatDeepSeek
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
 
-from config import DEEPSEEK_API_KEY, AGENT_MODEL
+from config import LLM_API_KEY, LLM_BASE_URL, AGENT_MODEL
 from database import (
     save_message, load_conversation, get_or_create_session,
     save_user_facts, load_user_facts,
@@ -85,9 +85,10 @@ class MemoryManager:
 
     def __init__(self):
         # 用一个轻量 LLM 实例做事实提取（temperature=0，低 token）
-        self._extractor_llm = ChatDeepSeek(
+        self._extractor_llm = ChatOpenAI(
             model=AGENT_MODEL,
-            api_key=DEEPSEEK_API_KEY,
+            api_key=LLM_API_KEY,
+            base_url=LLM_BASE_URL,
             temperature=0,
             max_tokens=500,
         )

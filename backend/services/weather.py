@@ -1,6 +1,5 @@
-import requests as http
-
 from config import AMAP_KEY
+from services.api_client import safe_get
 
 
 def fetch_weather(city_name: str, start_date: str = "", end_date: str = "") -> str:
@@ -12,11 +11,12 @@ def fetch_weather(city_name: str, start_date: str = "", end_date: str = "") -> s
         key = AMAP_KEY.strip()
 
         # 1. 通过地理编码获取城市 adcode
-        geo_resp = http.get(
+        geo_resp = safe_get(
             "https://restapi.amap.com/v3/geocode/geo",
             params={"address": city_name, "key": key},
-            timeout=8,
         )
+        if geo_resp is None:
+            return "（地理编码服务暂时不可用，请稍后重试）"
         if not geo_resp.text:
             return "（地理编码接口返回为空，请检查API Key是否正确）"
         geo_data = geo_resp.json()
@@ -26,11 +26,12 @@ def fetch_weather(city_name: str, start_date: str = "", end_date: str = "") -> s
         adcode = geo_data["geocodes"][0].get("adcode", "")
 
         # 2. 查询天气预报（extensions=all 返回预报）
-        fc_resp = http.get(
+        fc_resp = safe_get(
             "https://restapi.amap.com/v3/weather/weatherInfo",
             params={"city": adcode, "key": key, "extensions": "all"},
-            timeout=8,
         )
+        if fc_resp is None:
+            return "（天气服务暂时不可用，请稍后重试）"
         if not fc_resp.text:
             return "（天气接口返回为空，请检查API Key是否有天气查询权限）"
         fc_data = fc_resp.json()

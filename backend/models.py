@@ -23,6 +23,13 @@ class ChatRequest(BaseModel):
     sessionId: Optional[str] = ""
 
 
+class PlanChatRequest(BaseModel):
+        destination: str
+        message: str
+        plan_text: str  # 前端传来的行程方案全文
+        history: list[dict] = []
+
+
 class BookingRequest(BaseModel):
     dest: str
     name: str

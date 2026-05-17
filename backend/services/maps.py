@@ -1,8 +1,8 @@
 import math
 import re
-import requests as http
 
 from config import AMAP_KEY
+from services.api_client import safe_get
 
 
 # ── 基础 API 调用 ──
@@ -12,11 +12,12 @@ def geocode(address: str, city: str = "") -> tuple | None:
     if not AMAP_KEY:
         return None
     try:
-        resp = http.get(
+        resp = safe_get(
             "https://restapi.amap.com/v3/geocode/geo",
             params={"address": address, "city": city, "key": AMAP_KEY},
-            timeout=8,
         )
+        if resp is None:
+            return None
         data = resp.json()
         if data.get("geocodes"):
             loc = data["geocodes"][0]["location"]
@@ -30,11 +31,12 @@ def geocode(address: str, city: str = "") -> tuple | None:
 def reverse_geocode(lng: float, lat: float) -> str:
     """经纬度 → 地址描述"""
     try:
-        resp = http.get(
+        resp = safe_get(
             "https://restapi.amap.com/v3/geocode/regeo",
             params={"location": f"{lng},{lat}", "key": AMAP_KEY},
-            timeout=8,
         )
+        if resp is None:
+            return ""
         data = resp.json()
         return data.get("regeocode", {}).get("formatted_address", "")
     except Exception:
@@ -55,15 +57,16 @@ def haversine(lng1, lat1, lng2, lat2) -> float:
 def fetch_driving_route(origin: tuple, dest: tuple) -> dict | None:
     """驾车路线：返回 {distance_km, duration_min}"""
     try:
-        resp = http.get(
+        resp = safe_get(
             "https://restapi.amap.com/v3/direction/driving",
             params={
                 "origin": f"{origin[0]},{origin[1]}",
                 "destination": f"{dest[0]},{dest[1]}",
                 "key": AMAP_KEY,
             },
-            timeout=8,
         )
+        if resp is None:
+            return None
         data = resp.json()
         path = data.get("route", {}).get("paths", [{}])[0]
         dist_m = int(path.get("distance", 0))
@@ -76,7 +79,7 @@ def fetch_driving_route(origin: tuple, dest: tuple) -> dict | None:
 def fetch_transit_route(origin: tuple, dest: tuple, city: str) -> dict | None:
     """公交路线：返回 {duration_min, cost}"""
     try:
-        resp = http.get(
+        resp = safe_get(
             "https://restapi.amap.com/v3/direction/transit/integrated",
             params={
                 "origin": f"{origin[0]},{origin[1]}",
@@ -84,8 +87,9 @@ def fetch_transit_route(origin: tuple, dest: tuple, city: str) -> dict | None:
                 "city": city,
                 "key": AMAP_KEY,
             },
-            timeout=8,
         )
+        if resp is None:
+            return None
         data = resp.json()
         transit = data.get("route", {}).get("transits", [{}])[0]
         dur_s = int(transit.get("duration", 0))
@@ -126,7 +130,7 @@ def search_poi(city: str, keyword: str = "", poi_type: str = "") -> list[dict]:
     types = POI_TYPE_MAP.get(poi_type, "")
 
     try:
-        resp = http.get(
+        resp = safe_get(
             "https://restapi.amap.com/v3/place/text",
             params={
                 "keywords": keyword,
@@ -136,8 +140,9 @@ def search_poi(city: str, keyword: str = "", poi_type: str = "") -> list[dict]:
                 "offset": 10,
                 "key": AMAP_KEY,
             },
-            timeout=8,
         )
+        if resp is None:
+            return []
         data = resp.json()
         results = []
         for poi in data.get("pois", [])[:10]:
@@ -158,7 +163,7 @@ def search_poi(city: str, keyword: str = "", poi_type: str = "") -> list[dict]:
 def search_hotels(coord: tuple, city: str, radius: int = 5000) -> list[dict]:
     """搜索坐标附近酒店。"""
     try:
-        resp = http.get(
+        resp = safe_get(
             "https://restapi.amap.com/v3/place/around",
             params={
                 "location": f"{coord[0]},{coord[1]}",
@@ -169,8 +174,9 @@ def search_hotels(coord: tuple, city: str, radius: int = 5000) -> list[dict]:
                 "offset": 8,
                 "key": AMAP_KEY,
             },
-            timeout=8,
         )
+        if resp is None:
+            return []
         data = resp.json()
         hotels = []
         for poi in data.get("pois", [])[:8]:
@@ -191,7 +197,7 @@ def search_hotels_by_keyword(city: str, keyword: str = "") -> list[dict]:
     if not AMAP_KEY:
         return []
     try:
-        resp = http.get(
+        resp = safe_get(
             "https://restapi.amap.com/v3/place/text",
             params={
                 "keywords": keyword or "酒店",
@@ -201,8 +207,9 @@ def search_hotels_by_keyword(city: str, keyword: str = "") -> list[dict]:
                 "offset": 8,
                 "key": AMAP_KEY,
             },
-            timeout=8,
         )
+        if resp is None:
+            return []
         data = resp.json()
         hotels = []
         for poi in data.get("pois", [])[:8]:
